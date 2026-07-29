@@ -12,6 +12,7 @@ import (
 	"time"
 
 	commonapi "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
+	rvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redis/v1beta2"
 	rcvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/rediscluster/v1beta2"
 	rrvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redisreplication/v1beta2"
 	common "github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common"
@@ -686,7 +687,34 @@ func configureRedisClient(ctx context.Context, client kubernetes.Interface, cr *
 		}
 	}
 	opts := &redis.Options{
-		Addr:     getRedisServerAddress(ctx, client, redisInfo, *cr.Spec.Port),
+		Addr:         getRedisServerAddress(ctx, client, redisInfo, *cr.Spec.Port),
+		Password:     pass,
+		DB:           0,
+		DialTimeout:  defaultRedisClientTimeout,
+		ReadTimeout:  defaultRedisClientTimeout,
+		WriteTimeout: defaultRedisClientTimeout,
+	}
+	if cr.Spec.TLS != nil {
+		opts.TLSConfig = getRedisTLSConfig(ctx, client, cr.Namespace, cr.Spec.TLS)
+	}
+	return redis.NewClient(opts)
+}
+
+func configureRedisStandaloneClient(ctx context.Context, client kubernetes.Interface, cr *rvb2.Redis, podName string) *redis.Client {
+	redisInfo := RedisDetails{
+		PodName:   podName,
+		Namespace: cr.Namespace,
+	}
+	var err error
+	var pass string
+	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
+		pass, err = getRedisPassword(ctx, client, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "Error in getting redis password")
+		}
+	}
+	opts := &redis.Options{
+		Addr:     getRedisServerAddress(ctx, client, redisInfo, common.RedisPort),
 		Password: pass,
 		DB:       0,
 	}
@@ -705,6 +733,15 @@ func executeCommand(ctx context.Context, client kubernetes.Interface, cr *rcvb2.
 	}
 	log.FromContext(ctx).V(1).Info("Successfully executed the command", "Command", cmd, "Output", execOut)
 }
+
+// defaultExecCommandTimeout bounds a single exec stream against a redis pod. It is generous
+// enough for a legitimate slow `redis-cli --cluster create` while still guaranteeing the stream
+// (and therefore the reconcile worker) cannot block forever. Override with EXEC_COMMAND_TIMEOUT.
+const defaultExecCommandTimeout = 5 * time.Minute
+
+// defaultRedisClientTimeout bounds dial/read/write operations of the go-redis clients the
+// reconciler opens against redis pods, so an unreachable pod cannot stall a reconcile.
+const defaultRedisClientTimeout = 5 * time.Second
 
 func executeCommand1(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, cmd []string, podName string) (stdout string, stderr error) {
 	var (
@@ -735,7 +772,13 @@ func executeCommand1(ctx context.Context, client kubernetes.Interface, cr *rcvb2
 		return "", err
 	}
 
-	err = exec.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+	// Bound the exec stream with the reconcile ctx and a timeout so a blocked command (e.g. a
+	// `redis-cli --cluster create` against pods that cannot yet form a cluster) returns an error
+	// and requeues instead of pinning the reconcile worker forever, which would starve every
+	// other Redis resource across all namespaces.
+	execCtx, cancel := context.WithTimeout(ctx, envs.GetExecCommandTimeout(defaultExecCommandTimeout))
+	defer cancel()
+	err = exec.StreamWithContext(execCtx, remotecommand.StreamOptions{
 		Stdout: &execOut,
 		Stderr: &execErr,
 		Tty:    false,
@@ -748,7 +791,7 @@ func executeCommand1(ctx context.Context, client kubernetes.Interface, cr *rcvb2
 
 // getContainerID will return the id of container from pod
 func getContainerID(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, podName string) (int, *corev1.Pod) {
-	pod, err := client.CoreV1().Pods(cr.Namespace).Get(context.TODO(), podName, metav1.GetOptions{})
+	pod, err := client.CoreV1().Pods(cr.Namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
 		log.FromContext(ctx).Error(err, "Could not get pod info", "Pod Name", podName, "Namespace", cr.Namespace)
 		return -1, nil
@@ -827,9 +870,12 @@ func configureRedisReplicationClientForAddress(ctx context.Context, client kuber
 		addr = formatRedisAddress(podIP, 6379)
 	}
 	opts := &redis.Options{
-		Addr:     addr,
-		Password: pass,
-		DB:       0,
+		Addr:         addr,
+		Password:     pass,
+		DB:           0,
+		DialTimeout:  defaultRedisClientTimeout,
+		ReadTimeout:  defaultRedisClientTimeout,
+		WriteTimeout: defaultRedisClientTimeout,
 	}
 	if cr.Spec.TLS != nil {
 		opts.TLSConfig = getRedisTLSConfig(ctx, client, cr.Namespace, cr.Spec.TLS)
@@ -929,6 +975,29 @@ func checkRedisServerRole(ctx context.Context, redisClient *redis.Client, podNam
 	return "", err
 }
 
+func checkRedisOffset(ctx context.Context, redisClient *redis.Client, podName string) (int64, error) {
+	info, err := redisClient.Info(ctx, "Replication").Result()
+	if err != nil {
+		log.FromContext(ctx).Error(err, "Failed to Get the role Info of the", "redis pod", podName)
+		return 0, err
+	}
+	lines := strings.Split(info, "\r\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "master_repl_offset:") {
+			offsetStr := strings.TrimPrefix(line, "master_repl_offset:")
+			offset, err := strconv.ParseInt(offsetStr, 10, 64)
+			if err != nil {
+				log.FromContext(ctx).Error(err, "Failed to convert master_repl_offset to int64 for", "redis pod", podName)
+				return 0, err
+			}
+			log.FromContext(ctx).V(1).Info("Master replication offset of the Redis Pod", "pod", podName, "offset", offset)
+			return offset, nil
+		}
+	}
+	log.FromContext(ctx).Error(err, "Failed to find master_repl_offset from Info # Replication in", "redis pod", podName)
+	return 0, errors.New("master_repl_offset not found")
+}
+
 // checkAttachedSlave would return redis pod name which has slave
 func checkAttachedSlave(ctx context.Context, redisClient *redis.Client, podName string) int {
 	info, err := redisClient.Info(ctx, "Replication").Result()
@@ -1005,6 +1074,64 @@ func GetRedisReplicationRealMaster(ctx context.Context, client kubernetes.Interf
 	return ""
 }
 
+func GetRedisReplicationBestMaster(ctx context.Context, client kubernetes.Interface, cr *rrvb2.RedisReplication, masterPods []string) string {
+	var bestMasterPod string
+	var bestOffset int64 = -1
+
+	for _, podName := range masterPods {
+		redisClient := configureRedisReplicationClient(ctx, client, cr, podName)
+		defer redisClient.Close()
+
+		offset, err := checkRedisOffset(ctx, redisClient, podName)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "Failed to get replication offset for", "pod", podName)
+			continue
+		}
+
+		if offset > bestOffset {
+			bestOffset = offset
+			bestMasterPod = podName
+		}
+	}
+
+	return bestMasterPod
+}
+
+func applyDynamicConfig(ctx context.Context, redisClient *redis.Client, podName string, dynamicConfig []string) (bool, error) {
+	pong, err := redisClient.Ping(ctx).Result()
+	if err != nil {
+		log.FromContext(ctx).Error(err, "Failed to ping Redis instance", "pod", podName)
+		return false, nil
+	}
+	if pong != "PONG" {
+		log.FromContext(ctx).V(1).Info("Redis instance not ready", "pod", podName)
+		return false, nil
+	}
+
+	for _, config := range dynamicConfig {
+		parts := strings.SplitN(config, " ", 2)
+		if len(parts) != 2 {
+			log.FromContext(ctx).Error(nil, "Invalid config format", "config", config)
+			continue
+		}
+
+		if err := redisClient.ConfigSet(ctx, parts[0], parts[1]).Err(); err != nil {
+			log.FromContext(ctx).Error(err, "Failed to set config",
+				"key", parts[0],
+				"value", parts[1],
+				"pod", podName)
+			return true, err
+		}
+
+		log.FromContext(ctx).V(1).Info("Successfully set config",
+			"key", parts[0],
+			"value", parts[1],
+			"pod", podName)
+	}
+
+	return true, nil
+}
+
 // SetRedisClusterDynamicConfig applies dynamic configuration to each Redis instance in the cluster
 func SetRedisClusterDynamicConfig(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster) error {
 	// Get dynamic configuration
@@ -1027,42 +1154,58 @@ func SetRedisClusterDynamicConfig(ctx context.Context, client kubernetes.Interfa
 		}
 
 		redisClient := configureRedisClient(ctx, client, cr, podName)
-		defer redisClient.Close()
-
-		// Check if Redis instance is accessible
-		pong, err := redisClient.Ping(ctx).Result()
+		_, err := applyDynamicConfig(ctx, redisClient, podName, dynamicConfig)
+		redisClient.Close()
 		if err != nil {
-			log.FromContext(ctx).Error(err, "Failed to ping Redis instance", "pod", podName)
-			continue
-		}
-		if pong != "PONG" {
-			log.FromContext(ctx).V(1).Info("Redis instance not ready", "pod", podName)
-			continue
-		}
-
-		// Apply dynamic configuration parameters
-		for _, config := range dynamicConfig {
-			parts := strings.SplitN(config, " ", 2)
-			if len(parts) != 2 {
-				log.FromContext(ctx).Error(nil, "Invalid config format", "config", config)
-				continue
-			}
-
-			err := redisClient.ConfigSet(ctx, parts[0], parts[1]).Err()
-			if err != nil {
-				log.FromContext(ctx).Error(err, "Failed to set config",
-					"key", parts[0],
-					"value", parts[1],
-					"pod", podName)
-				return err
-			}
-
-			log.FromContext(ctx).V(1).Info("Successfully set config",
-				"key", parts[0],
-				"value", parts[1],
-				"pod", podName)
+			return err
 		}
 	}
 
 	return nil
+}
+
+func SetRedisReplicationDynamicConfig(ctx context.Context, client kubernetes.Interface, cr *rrvb2.RedisReplication) error {
+	return setRedisReplicationDynamicConfig(ctx, cr, func(podName string) *redis.Client {
+		return configureRedisReplicationClient(ctx, client, cr, podName)
+	})
+}
+
+func setRedisReplicationDynamicConfig(ctx context.Context, cr *rrvb2.RedisReplication, makeClient func(podName string) *redis.Client) error {
+	dynamicConfig := cr.Spec.GetRedisDynamicConfig()
+	if len(dynamicConfig) == 0 {
+		return nil
+	}
+
+	replicas := cr.Spec.GetReplicationCounts("")
+	for i := 0; i < int(replicas); i++ {
+		podName := cr.Name + "-" + strconv.Itoa(i)
+
+		redisClient := makeClient(podName)
+		_, err := applyDynamicConfig(ctx, redisClient, podName, dynamicConfig)
+		redisClient.Close()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func SetRedisStandaloneDynamicConfig(ctx context.Context, client kubernetes.Interface, cr *rvb2.Redis) (bool, error) {
+	return setRedisStandaloneDynamicConfig(ctx, cr, func(podName string) *redis.Client {
+		return configureRedisStandaloneClient(ctx, client, cr, podName)
+	})
+}
+
+func setRedisStandaloneDynamicConfig(ctx context.Context, cr *rvb2.Redis, makeClient func(podName string) *redis.Client) (bool, error) {
+	dynamicConfig := cr.Spec.GetRedisDynamicConfig()
+	if len(dynamicConfig) == 0 {
+		return true, nil
+	}
+
+	podName := cr.Name + "-0"
+	redisClient := makeClient(podName)
+	defer redisClient.Close()
+
+	return applyDynamicConfig(ctx, redisClient, podName, dynamicConfig)
 }
